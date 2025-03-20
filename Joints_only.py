@@ -1,15 +1,10 @@
-#Joel Kabura
-# Date: 2023-10-01
-# Description:
-# This script is a simplified version of MimicPlay for myCobot 280 that doesn't rely on MimicPlay utilities.
-# It initializes a RealSense D55 camera, loads high-level and low-level models directly from file paths,
-# and provides a simple loop to demonstrate model loading and camera input.
-# It generates simulated joint angles for the robot and displays them alongside camera input.
-# IF you need the robotic arm to move just confrige the robot make sure its connected any replay the printed joint angles to the robot function.
-
 #!/usr/bin/env python3
 """
-Simplified MimicPlay implementation for myCobot 280 that doesn't rely on MimicPlay utilities.
+MimicPlay implementation for Elephant Robotics myCobot 280 with optional RealSense D55 camera.
+This script loads trained high-level and low-level models from MimicPlay and prints
+the joint angles without sending commands to the physical robot.
+
+If you don't have a camera for testing, use the --dummy-camera flag to generate dummy observations.
 """
 
 import os
@@ -18,270 +13,288 @@ import time
 import argparse
 import numpy as np
 import cv2
-import torch
 import pyrealsense2 as rs
-import json  # Added to parse config strings
+from pymycobot.mycobot import MyCobot
+from collections import OrderedDict
+import torch
 
-class SimpleMimicPlayMyCobot:
-    def __init__(self, highlevel_model_path, lowlevel_model_path, camera_width=640, camera_height=480, fps=30):
+# Add MimicPlay to path
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "MimicPlay"))
+
+# Import MimicPlay modules
+from MimicPlay.utils.file_utils import policy_from_checkpoint
+# Removed tensor_utils import as it's not used.
+import MimicPlay.utils.obs_utils as ObsUtils
+
+class MimicPlayMyCobot:
+    def __init__(self, highlevel_model_path, lowlevel_model_path, camera_width=640, camera_height=480, fps=30, use_dummy_camera=False):
         """
-        Initialize simplified MimicPlay for myCobot 280 with RealSense D55 camera.
+        Initialize MimicPlay for myCobot 280 with optional RealSense D55 camera.
+        
+        Args:
+            highlevel_model_path: Path to the high-level model checkpoint
+            lowlevel_model_path: Path to the low-level model checkpoint
+            camera_width: Width of camera frames
+            camera_height: Height of camera frames
+            fps: Camera frames per second
+            use_dummy_camera: If True, do not initialize a real camera and use dummy observations
         """
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
-        # Store model paths
-        self.highlevel_model_path = os.path.abspath(highlevel_model_path)
-        self.lowlevel_model_path = os.path.abspath(lowlevel_model_path)
-        print(f"High-level model path: {self.highlevel_model_path}")
-        print(f"Low-level model path: {self.lowlevel_model_path}")
-        
-        # Initialize camera
         self.camera_width = camera_width
         self.camera_height = camera_height
         self.fps = fps
-        self.initialize_camera()
+        self.use_dummy_camera = use_dummy_camera
         
-        # Load models directly
-        self.load_models_directly()
+        if not self.use_dummy_camera:
+            self.initialize_camera()
+        else:
+            print("Running in dummy camera mode. Skipping camera initialization.")
+        
+        # Load models
+        self.load_models(highlevel_model_path, lowlevel_model_path)
+        
+        # Initialize observation buffer
+        self.obs_buffer = {}
         
     def initialize_camera(self):
         """Initialize RealSense D55 camera"""
         print("Initializing RealSense D55 camera...")
-        try:
-            self.pipeline = rs.pipeline()
-            self.config = rs.config()
-            
-            # Configure streams
-            self.config.enable_stream(rs.stream.color, self.camera_width, self.camera_height, rs.format.bgr8, self.fps)
-            self.config.enable_stream(rs.stream.depth, self.camera_width, self.camera_height, rs.format.z16, self.fps)
-            
-            # Start streaming
-            self.profile = self.pipeline.start(self.config)
-            
-            # Allow camera to warm up
-            for i in range(30):
-                self.pipeline.wait_for_frames()
-            
-            print("Camera initialized successfully")
-        except Exception as e:
-            print(f"Error initializing camera: {e}")
-            print("Continuing with simulated camera input")
-            self.pipeline = None
-            
-    def load_models_directly(self):
-        """Load model files directly without MimicPlay utilities"""
-        print("Loading model files directly...")
-        try:
-            # Load model files
-            self.highlevel_model = torch.load(self.highlevel_model_path, map_location=self.device)
-            self.lowlevel_model = torch.load(self.lowlevel_model_path, map_location=self.device)
-            
-            # Print model information
-            print("\nHigh-level model keys:")
-            for key in self.highlevel_model.keys():
-                print(f"  - {key}")
-            
-            print("\nLow-level model keys:")
-            for key in self.lowlevel_model.keys():
-                print(f"  - {key}")
-            
-            # Extract state dictionaries
-            if "state_dict" in self.highlevel_model:
-                self.highlevel_state_dict = self.highlevel_model["state_dict"]
-                print("\nHigh-level model has state_dict with keys:")
-                for key in list(self.highlevel_state_dict.keys())[:10]:  # Show first 10 keys
-                    print(f"  - {key}")
-                print(f"  ... and {len(self.highlevel_state_dict) - 10} more keys")
-            else:
-                print("High-level model does not have state_dict")
-            
-            if "state_dict" in self.lowlevel_model:
-                self.lowlevel_state_dict = self.lowlevel_model["state_dict"]
-                print("\nLow-level model has state_dict with keys:")
-                for key in list(self.lowlevel_state_dict.keys())[:10]:  # Show first 10 keys
-                    print(f"  - {key}")
-                print(f"  ... and {len(self.lowlevel_state_dict) - 10} more keys")
-            else:
-                print("Low-level model does not have state_dict")
-            
-            # Extract config if available
-            if "config" in self.highlevel_model:
-                print("\nHigh-level model has config")
-            
-            if "config" in self.lowlevel_model:
-                print("Low-level model has config")
-            
-            print("\nModels loaded successfully")
-            
-        except Exception as e:
-            print(f"Error loading models: {e}")
-            sys.exit(1)
-            
-    def get_camera_observation(self):
-        """Get observation from RealSense camera"""
-        if self.pipeline is None:
-            return self.get_simulated_observation()
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
         
-        try:
+        # Configure streams
+        self.config.enable_stream(rs.stream.color, self.camera_width, self.camera_height, rs.format.bgr8, self.fps)
+        self.config.enable_stream(rs.stream.depth, self.camera_width, self.camera_height, rs.format.z16, self.fps)
+        
+        # Start streaming
+        self.profile = self.pipeline.start(self.config)
+        
+        # Get camera intrinsics
+        self.color_profile = self.profile.get_stream(rs.stream.color)
+        self.color_intrinsics = self.color_profile.as_video_stream_profile().get_intrinsics()
+        
+        # Allow camera to warm up
+        for i in range(30):
+            self.pipeline.wait_for_frames()
+        
+        print("Camera initialized successfully")
+        
+    def load_models(self, highlevel_model_path, lowlevel_model_path):
+        """
+        Load high-level and low-level models from checkpoints
+        
+        Args:
+            highlevel_model_path: Path to high-level model checkpoint
+            lowlevel_model_path: Path to low-level model checkpoint
+        """
+        print("Loading high-level model...")
+        self.highlevel_policy, self.highlevel_ckpt = policy_from_checkpoint(
+            ckpt_path=highlevel_model_path,
+            device=self.device,
+            verbose=True
+        )
+        
+        print("Loading low-level model...")
+        self.lowlevel_policy, self.lowlevel_ckpt = policy_from_checkpoint(
+            ckpt_path=lowlevel_model_path,
+            device=self.device,
+            verbose=True
+        )
+        
+        # Extract metadata
+        self.highlevel_shape_meta = self.highlevel_ckpt["shape_metadata"]
+        self.lowlevel_shape_meta = self.lowlevel_ckpt["shape_metadata"]
+        
+        print("Models loaded successfully")
+        
+    def get_camera_observation(self):
+        """
+        Get observation from RealSense camera or generate a dummy observation
+        
+        Returns:
+            obs: Dictionary containing the observation tensor and dummy robot states
+            color_image: Color image (dummy or real)
+            depth_image: Depth colormap (dummy or real)
+        """
+        if self.use_dummy_camera:
+            # Create a dummy color image (black image)
+            color_image = np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8)
+            # Create a dummy depth image (black image)
+            depth_image = np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8)
+        else:
             # Wait for a coherent pair of frames: depth and color
             frames = self.pipeline.wait_for_frames()
             depth_frame = frames.get_depth_frame()
             color_frame = frames.get_color_frame()
-            
+        
             if not depth_frame or not color_frame:
-                print("Failed to get frames from camera")
-                return self.get_simulated_observation()
-            
+                return None, None, None
+                
             # Convert images to numpy arrays
-            depth_image = np.asanyarray(depth_frame.get_data())
+            depth_array = np.asanyarray(depth_frame.get_data())
             color_image = np.asanyarray(color_frame.get_data())
             
             # Apply colormap on depth image (convert to 8-bit per pixel first)
-            depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(depth_image, alpha=0.03), cv2.COLORMAP_JET)
+            depth_image = cv2.applyColorMap(cv2.convertScaleAbs(depth_array, alpha=0.03), cv2.COLORMAP_JET)
+        
+        # Resize images to match the expected input size for the models (84x84)
+        resized_color = cv2.resize(color_image, (84, 84))
+        
+        # Normalize the image (convert to float and scale to [0, 1])
+        normalized_color = resized_color.astype(np.float32) / 255.0
+        
+        # Convert to PyTorch tensor and add batch dimension
+        color_tensor = torch.from_numpy(normalized_color).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        
+        # Create observation dictionary with dummy proprioception data
+        obs = {
+            "agentview_image": color_tensor,
+            "robot0_eef_pos": torch.zeros((1, 3), dtype=torch.float32).to(self.device),
+            "robot0_joint_pos": torch.zeros((1, 6), dtype=torch.float32).to(self.device)
+        }
             
-            # Resize images to match the expected input size for the models
-            resized_color = cv2.resize(color_image, (84, 84))
+        return obs, color_image, depth_image
+        
+    def process_highlevel_output(self, highlevel_output):
+        """
+        Process output from high-level model to get subgoal for low-level model
+        
+        Args:
+            highlevel_output: Output from high-level model
             
-            return resized_color, depth_colormap
+        Returns:
+            Processed subgoal for low-level model
+        """
+        # Extract the subgoal (future trajectory)
+        subgoal = highlevel_output.detach().cpu().numpy()
         
-        except Exception as e:
-            print(f"Error getting camera observation: {e}")
-            return self.get_simulated_observation()
+        # Create a goal dictionary for the low-level model
+        goal_dict = {
+            "robot0_eef_pos_future_traj": torch.from_numpy(subgoal).to(self.device)
+        }
         
-    def get_simulated_observation(self):
-        """Generate simulated observation when camera is not available"""
-        print("Generating simulated camera input...")
+        return goal_dict
         
-        # Create a simple pattern
-        color_image = np.zeros((84, 84, 3), dtype=np.uint8)
-        for i in range(84):
-            for j in range(84):
-                color_image[i, j] = [i * 255 // 84, j * 255 // 84, 128]
+    def process_lowlevel_output(self, lowlevel_output):
+        """
+        Process output from low-level model to get joint angles for myCobot
         
-        depth_colormap = color_image.copy()
+        Args:
+            lowlevel_output: Output from low-level model
+            
+        Returns:
+            Joint angles for myCobot 280
+        """
+        # Extract the joint angles
+        joint_angles = lowlevel_output.detach().cpu().numpy()
         
-        return color_image, depth_colormap
+        # Scale the joint angles from [-1, 1] to the joint limits of myCobot 280 (in degrees)
+        joint_limits = np.array([
+            [-160, 160],  # J1
+            [-160, 160],  # J2
+            [-180, 180],  # J3
+            [-180, 180],  # J4
+            [-180, 180],  # J5
+            [-180, 180],  # J6
+        ])
         
-    def print_model_structure(self):
-        """Print the structure of the models"""
-        print("\n=== Model Structure Analysis ===")
+        scaled_angles = np.zeros(6)
+        for i in range(min(6, joint_angles.shape[0])):
+            scaled_angles[i] = np.interp(joint_angles[i], [-1, 1], joint_limits[i])
+            
+        return scaled_angles
         
-        # Print high-level model structure
-        print("\nHigh-level model structure:")
-        if "shape_metadata" in self.highlevel_model:
-            shape_meta = self.highlevel_model["shape_metadata"]
-            print(f"  Shape metadata: {shape_meta}")
+    def print_joint_angles(self, joint_angles):
+        """
+        Print joint angles instead of sending to robot
         
-        # Print low-level model structure
-        print("\nLow-level model structure:")
-        if "shape_metadata" in self.lowlevel_model:
-            shape_meta = self.lowlevel_model["shape_metadata"]
-            print(f"  Shape metadata: {shape_meta}")
+        Args:
+            joint_angles: Array of 6 joint angles in degrees
+        """
+        print("=" * 50)
+        print("Joint Angles (degrees):")
+        print("-" * 50)
+        for i, angle in enumerate(joint_angles):
+            print(f"Joint {i+1}: {angle:.2f}")
+        print("=" * 50)
+            
+    def run(self, num_steps=100, visualize=True):
+        """
+        Run the MimicPlay control loop
         
-        # Print action dimensions if available
-        if "config" in self.lowlevel_model:
-            lowlevel_config = self.lowlevel_model["config"]
-            # If the config is a string, try to parse it as JSON
-            if isinstance(lowlevel_config, str):
-                try:
-                    lowlevel_config = json.loads(lowlevel_config)
-                except Exception as e:
-                    print("Error parsing lowlevel model config string:", e)
-                    lowlevel_config = {}
-            if "algo" in lowlevel_config and "lowlevel" in lowlevel_config["algo"]:
-                config_section = lowlevel_config["algo"]["lowlevel"]
-                if "action_dim" in config_section:
-                    action_dim = config_section["action_dim"]
-                    print(f"\nAction dimension: {action_dim}")
-                    print(f"This means the model outputs {action_dim} values:")
-                    print(f"  - First 6 values: Joint angles for the 6 DOF robot")
-                    if action_dim > 6:
-                        print(f"  - Value {action_dim}: Gripper command (positive = open, negative = close)")
+        Args:
+            num_steps: Number of control steps to run
+            visualize: Whether to visualize the (dummy or real) camera input
+        """
+        print(f"Running MimicPlay control loop for {num_steps} steps...")
         
-    def run(self, num_steps=10, visualize=True):
-        """Run a simple loop to demonstrate model loading and camera input"""
-        print(f"\nRunning simple demonstration for {num_steps} steps...")
+        # Start the policies
+        self.highlevel_policy.start_episode()
+        self.lowlevel_policy.start_episode()
         
-        # Print model structure
-        self.print_model_structure()
-        
-        # Simulate what the output would look like
-        print("\n=== Simulated Joint Angle Output ===")
         for step in range(num_steps):
-            # Get camera observation
-            color_image, depth_image = self.get_camera_observation()
+            print(f"Step {step+1}/{num_steps}")
             
-            # Display images if requested
+            # Get observation from camera or dummy generator
+            obs_dict, color_image, depth_image = self.get_camera_observation()
+            if obs_dict is None:
+                print("Failed to get observation")
+                continue
+                
+            # Get high-level output (subgoal)
+            highlevel_output = self.highlevel_policy(ob=obs_dict)
+            
+            # Process high-level output to get subgoal for low-level model
+            goal_dict = self.process_highlevel_output(highlevel_output)
+            
+            # Get low-level output (joint angles)
+            lowlevel_output = self.lowlevel_policy(ob=obs_dict, goal=goal_dict)
+            
+            # Process low-level output to get joint angles for myCobot
+            joint_angles = self.process_lowlevel_output(lowlevel_output)
+            
+            # Print joint angles instead of sending to robot
+            self.print_joint_angles(joint_angles)
+            
+            # Visualize (if desired)
             if visualize:
                 cv2.imshow('Color', color_image)
                 cv2.imshow('Depth', depth_image)
-                
-                # Exit on ESC
                 key = cv2.waitKey(1)
-                if key == 27:  # ESC
+                if key == 27:  # ESC key to exit
                     break
-            
-            # Simulate joint angle output
-            print(f"\nStep {step+1}/{num_steps}")
-            print("=" * 50)
-            print("Joint Angles (degrees):")
-            print("-" * 50)
-            
-            # Generate simulated joint angles based on step
-            t = step / 5.0  # Time variable
-            joint_angles = [
-                np.sin(t) * 160,             # J1: -160 to 160
-                np.cos(t) * 160,             # J2: -160 to 160
-                np.sin(t * 0.5) * 180,       # J3: -180 to 180
-                np.cos(t * 0.5) * 180,       # J4: -180 to 180
-                np.sin(t * 0.25) * 180,      # J5: -180 to 180
-                np.cos(t * 0.25) * 180,      # J6: -180 to 180
-                np.sin(t * 2) * 0.9          # Gripper: -1 to 1
-            ]
-            
-            # Print joint angles
-            for i in range(6):
-                print(f"Joint {i+1}: {joint_angles[i]:.2f}")
-            
-            # Print gripper command
-            print("-" * 50)
-            print(f"Gripper command: {joint_angles[6]:.4f}")
-            print(f"Gripper state: {'OPEN' if joint_angles[6] > 0 else 'CLOSED'}")
-            print("=" * 50)
-            
-            # Add a small delay
-            time.sleep(0.5)
-        
-        # Clean up
+                    
+        # Clean up visualization
         if visualize:
             cv2.destroyAllWindows()
-        
-        # Stop camera
-        if self.pipeline is not None:
+            
+        # Stop the camera pipeline if a real camera was used
+        if not self.use_dummy_camera:
             self.pipeline.stop()
         
-        print("\nDemonstration completed")
-        print("To use the actual models for inference, you'll need to properly install MimicPlay")
-        print("or modify the script to use the model weights directly")
-        
 def main():
-    parser = argparse.ArgumentParser(description='Simple MimicPlay Model Inspector')
+    parser = argparse.ArgumentParser(description='MimicPlay for myCobot 280 (Print Only)')
     parser.add_argument('--highlevel', type=str, required=True, help='Path to high-level model checkpoint')
     parser.add_argument('--lowlevel', type=str, required=True, help='Path to low-level model checkpoint')
-    parser.add_argument('--steps', type=int, default=10, help='Number of steps to run')
+    parser.add_argument('--steps', type=int, default=100, help='Number of control steps to run')
     parser.add_argument('--no-viz', action='store_true', help='Disable visualization')
+    parser.add_argument('--dummy-camera', action='store_true', help='Use dummy camera input (no physical camera needed)')
     
     args = parser.parse_args()
     
-    # Create SimpleMimicPlayMyCobot instance
-    mimic = SimpleMimicPlayMyCobot(
+    # Create MimicPlayMyCobot instance with dummy camera flag if specified
+    mimic = MimicPlayMyCobot(
         highlevel_model_path=args.highlevel,
-        lowlevel_model_path=args.lowlevel
+        lowlevel_model_path=args.lowlevel,
+        use_dummy_camera=args.dummy_camera
     )
     
-    # Run demonstration
+    # Run control loop
     mimic.run(num_steps=args.steps, visualize=not args.no_viz)
     
 if __name__ == '__main__':
     main()
+
+
